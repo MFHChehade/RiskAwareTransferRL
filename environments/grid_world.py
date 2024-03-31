@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from visualization.heat_map import plot_heatmap_with_arrows as heat_map
+from stochastic_reward import StochasticReward
 
 class GridWorld(Env):  # Inheriting from Env
     UP = 0
@@ -59,7 +60,7 @@ class GridWorld(Env):  # Inheriting from Env
 
         # Transition probabilities
         assert 0 <= proba <= 1, "Probability should be between 0 and 1"
-        self.transition_probabilities = [proba] + [(1 - proba) / (len(self.actions) - 1)] * (len(self.actions) - 1)
+        self.transition_probabilities = [proba] + [(1 - proba) / (len(self.actions) - 2)] * (len(self.actions) - 2) + [0]
 
         # Terminal and barrier states
         if terminal_states is not None:
@@ -78,20 +79,25 @@ class GridWorld(Env):  # Inheriting from Env
 
         # Initialize rewards grid
         if rewards is None:
-            self.rewards = np.full((self.height, self.width), -1)  # Fill with -1 everywhere
+            self.rewards = [[StochasticReward(-1, deterministic = True, mean = - 1) for _ in range(self.width)] for _ in range(self.height)]
 
             # Update terminal states to have 0 reward
             if self.terminal_states != []:
                 for terminal_state in self.terminal_states:
                     x, y = terminal_state
-                    self.rewards[y, x] = 0
+                    self.rewards[y][x] = StochasticReward(deterministic = True, mean = 0)
             else:
                 # If no terminal states, set the reward of the bottom-right cell to 0
-                self.rewards[self.height - 1, self.width - 1] = 0
+                self.rewards[self.height - 1][self.width - 1] = StochasticReward(deterministic = True, mean = 0)
                 self.terminal_states = [(self.height - 1, self.width - 1)]
         else:
-            self.rewards = np.array(rewards)
-            assert self.rewards.shape == (self.height, self.width), "Rewards array size should match grid dimensions"
+            if isinstance(rewards, (list, np.ndarray)) and all(isinstance(row, (list, np.ndarray)) and all(isinstance(val, (float, int)) for val in row) for row in rewards):
+                # If rewards is a 2D list of numbers, use them as deterministic rewards
+                self.rewards = [[StochasticReward(value, deterministic=True, mean=value) for value in row] for row in rewards]
+            else:
+                self.rewards = rewards
+        self.expected_rewards = np.array([[reward.expected_value() for reward in row] for row in self.rewards])
+        assert self.expected_rewards.shape == (self.height, self.width), "Rewards array size should match grid dimensions"
 
         # State initialization (ensure self.reset() exists)
         self.encoded_state = self.reset()
@@ -106,9 +112,21 @@ class GridWorld(Env):  # Inheriting from Env
             self.distinct_rewards = distinct_rewards
         self.weights = self.get_weights()
         self.n_weights = len(self.weights)
-        
 
-    # --- State Handling ---
+        # Barrier set
+        self.barrier_set = set()
+        for state in range(self.n_states):
+            if self.get_expected_reward(self.decode_state(state), 0, self.decode_state(state)) < 0:
+                self.barrier_set.add(state)
+        
+        # Danger set
+        self.danger_sets = []
+        for element in self.barrier_set:
+            danger_set = {element}
+            self.danger_sets.append(danger_set)
+
+
+    # ------------- State Handling -------------
     def reset(self) -> int:
         self.transitions = []  # Reset transition sequence
         if self.initial_state is not None:
@@ -133,6 +151,22 @@ class GridWorld(Env):  # Inheriting from Env
         # Get reward for specific position in the grid
         return self.rewards[next_state[1]][next_state[0]]
     
+    def get_sampled_reward(self, state, action, next_state) -> float:
+        # Get sampled reward for a given state-action pair
+        return self.rewards[next_state[1]][next_state[0]].sample()[0]
+    
+    def get_expected_reward(self, state, action, next_state) -> float:
+        # Get expected reward for a given state-action pair
+        return self.rewards[next_state[1]][next_state[0]].expected_value()
+    
+    def get_expected_reward_squared(self, state, action, next_state) -> float:
+        # Get expected squared reward for a given state-action pair
+        return self.rewards[next_state[1]][next_state[0]].expected_value_squared()
+    
+    def get_reward_variance(self, state, action, next_state) -> float:
+        # Get reward variance for a given state-action pair
+        return self.rewards[next_state[1]][next_state[0]].variance()
+    
     def encode_state(self, state: Tuple[int, int]) -> int:
         # Encode the state as a single integer
         x, y = state
@@ -144,25 +178,42 @@ class GridWorld(Env):  # Inheriting from Env
         y = encoded_state % self.width
         return x, y
     
-    # --- Successor Feature Handling ---
+
+    # ------------- Successor Feature Handling -------------
     def get_weights(self) -> List[float]:
-        # Get weights for the task
+        """
+        Retrieves the weight vector for the current task.
+
+        Returns:
+        - List[float]: A list of weights. For the task "Same Blocks, Varying Values", this list represents the unique rewards encountered, padded with zeros if necessary to match a predefined number of distinct rewards. For other tasks, it generates a vector of expected rewards for each state.
+        """
+
         if self.task == "Same Blocks, Varying Values":
             weights = np.unique(self.rewards)
             if len(weights) < self.distinct_rewards:
                 # append zeros at the beginning of the array
                 weights = np.append(np.zeros(self.distinct_rewards - len(weights)), weights)
         else:
-            weights = np.zeros(self.rewards.shape[0] * self.rewards.shape[1])
+            weights = np.zeros(self.expected_rewards.shape[0] * self.expected_rewards.shape[1])
             for state in range(self.n_states):
                 x, y = self.decode_state(state)
-                weights[state] = self.rewards[y][x]
+                weights[state] = self.expected_rewards[y][x]
 
         return weights
-    
 
     def get_feature_vector(self, state, action, next_state) -> np.ndarray:
-        # Get feature vector for a given state-action-state transition
+        """
+        Computes the feature vector for a given state-action-next state transition.
+
+        Parameters:
+        - state: The current state from which the action is taken.
+        - action: The action taken by the agent.
+        - next_state: The state reached after taking the action.
+
+        Returns:
+        - np.ndarray: A binary vector indicating the occurrence of specific features or rewards as a result of the state-action-next state transition.
+        """
+
         if self.task == "Same Blocks, Varying Values":
             reward = self.get_reward(state, action, next_state)
             feature_vector = (self.weights == reward).astype(int)
@@ -171,57 +222,87 @@ class GridWorld(Env):  # Inheriting from Env
             feature_vector[self.encode_state(next_state)] = 1
         return feature_vector
 
-    # --- Agent Movement ---
+
+    # ------------- Agent Movement -------------
     def move_agent(self, action: int) -> Tuple[int, int]:
-        # Move agent within the grid based on the action
-        x, y = self.state
+        """
+        Moves the agent to a new position in the grid based on the specified action, considering barriers.
+
+        Parameters:
+        - action (int): The action to be taken by the agent. Actions are encoded as integers representing directions (e.g., UP, DOWN, LEFT, RIGHT).
+
+        Returns:
+        - Tuple[int, int]: The new position of the agent in the grid as (x, y) coordinates.
+
+        """
+        
+        x, y = self.state  # Current position
 
         if action == self.UP and y < self.height - 1 and (x, y + 1) not in self.barrier_states:
-            return x, y + 1  # Up
+            return x, y + 1  # Move Up
         elif action == self.DOWN and y > 0 and (x, y - 1) not in self.barrier_states:
-            return x, y - 1  # Down
+            return x, y - 1  # Move Down
         elif action == self.LEFT and x > 0 and (x - 1, y) not in self.barrier_states:
-            return x - 1, y  # Left
+            return x - 1, y  # Move Left
         elif action == self.RIGHT and x < self.width - 1 and (x + 1, y) not in self.barrier_states:
-            return x + 1, y  # Right
+            return x + 1, y  # Move Right
         else:
-            return x, y  # No valid action or blocked, state remains the same
+            return x, y  # No move or blocked by barrier, stay in current positio
         
     def set_action_probabilities(self, action: int) -> List[float]:
-            probabilities = [0.0] * self.n_actions
+        """
+        Calculate and return the transition probabilities for each action based on the current action.
+        
+        Parameters:
+        - action (int): The current action taken by the agent. Actions are encoded as integers.
+        
+        Returns:
+        - List[float]: A list of probabilities corresponding to each action. The list's length is equal to the number of actions, and each element represents the probability of transitioning to the corresponding action from the current action.
+        
+        """
+        
+        probabilities = [0.0] * self.n_actions
 
-            # Define neighboring actions
-            right_action = self.actions[(action + 1) % self.n_actions]
-            left_action = self.actions[(action - 1) % self.n_actions]
-            down_action = self.actions[(action + 2) % self.n_actions]
+        # Define neighboring actions based on the current action
+        right_action = self.actions[(action + 1) % self.n_actions]
+        left_action = self.actions[(action - 1) % self.n_actions]
+        down_action = self.actions[(action + 2) % self.n_actions]
 
-            # Assign transition probabilities to actions
-            probabilities[action] = self.transition_probabilities[0]
-            probabilities[right_action] = self.transition_probabilities[1]
-            probabilities[left_action] = self.transition_probabilities[2]
-            probabilities[down_action] = self.transition_probabilities[3]
+        # Assign transition probabilities to actions
+        probabilities[action] = self.transition_probabilities[0]
+        probabilities[right_action] = self.transition_probabilities[1]
+        probabilities[left_action] = self.transition_probabilities[2]
+        probabilities[down_action] = self.transition_probabilities[3]
 
-            return probabilities
-            
-    # --- Step Functionality ---
+        return probabilities
+
     def step(self, input_action: int) -> Tuple[int, float, bool, dict]:
-        # Perform a step in the GridWorld based on the input action
+        """
+        Execute a step in the GridWorld environment based on the input action.
+
+        Parameters:
+        - input_action (int): The action chosen by the agent to perform in the current state. The actions are encoded as integers.
+
+        Returns:
+        - Tuple[int, float, bool, dict]: A tuple containing the new encoded state, reward received, a boolean indicating if the episode has finished, and an empty dictionary that can be used for additional information in the future.
+        
+         """
 
         current_state = self.state
 
+        probabilities = self.set_action_probabilities(input_action)
+
         # Define the numbers and their probabilities
         actions = list(range(self.n_actions))
-        other_actions = [action for action in actions if action != input_action]
-        numbers = [input_action] + other_actions
 
         # Sample an action with the specified probabilities
-        sampled_action = np.random.choice(numbers, p=self.transition_probabilities)
+        sampled_action = np.random.choice(actions, p=probabilities)
 
         # Get the new state after the agent's movement based on the sampled action
         new_state = self.move_agent(sampled_action)
 
         # Calculate the reward of the new state
-        reward = self.get_reward(current_state, sampled_action, new_state)
+        reward = self.get_sampled_reward(current_state, sampled_action, new_state)
 
         # Check if the episode is done (new state is a terminal state)
         done = self.is_terminal_state(new_state)
@@ -234,9 +315,9 @@ class GridWorld(Env):  # Inheriting from Env
         self.transitions.append((current_state, sampled_action, reward, new_state, done))
 
         return self.encoded_state, reward, done, {}
+
     
-    
-    # --- Visualization ---
+    # ------------- Visualization -------------
     def arrow_map(self, action):
         """
         Converts action integers into arrow symbols.
@@ -269,7 +350,7 @@ class GridWorld(Env):  # Inheriting from Env
         locations = [(x, y) for ((x, y), _, _, _, _) in self.transitions]
 
         # Plot heatmap using rewards and arrow transitions
-        heat_map(self.rewards, arrow_transitions, locations)
+        heat_map(self.expected_rewards, arrow_transitions, locations)
 
     def plot_policy(self, pi, values=None, title=None):
         """
@@ -281,7 +362,7 @@ class GridWorld(Env):  # Inheriting from Env
         title (str): Title of the plot (default is 'Heat Map of Policy').
         """
         if values is None:
-            values = self.rewards
+            values = self.expected_rewards
 
         if title is None:
             title = "Heat Map of Policy"
@@ -299,10 +380,6 @@ class GridWorld(Env):  # Inheriting from Env
                     if pi_state[action] != 0:
                         arrow_state.append(self.arrow_map(action))
                 arrow_policy.append(arrow_state)
-        
-
-    
-        
 
         # Plot heatmap using policy values and arrow representations
         heat_map(values, arrow_policy, locations, title=title)
@@ -321,13 +398,14 @@ class GridWorld(Env):  # Inheriting from Env
             actions.append(action)
             locations.append(self.state)
         arrows = [self.arrow_map(action) for action in actions]
-        heat_map(self.rewards, arrows, locations, title=title)
+        heat_map(self.expected_rewards, arrows, locations, title=title)
 
     def __str__(self):
         # Print the GridWorld object
-        return f"GridWorld(height={self.height}, width={self.width}, rewards={self.rewards}, terminal_states={self.terminal_states}, barrier_states={self.barrier_states})"
+        return f"GridWorld(height={self.height}, width={self.width}, rewards={self.expected_rewards}, terminal_states={self.terminal_states}, barrier_states={self.barrier_states})"
 
-    # --- Close --- 
+
+    # ------------- Close ------------- 
     def close(self):
         pass
 
